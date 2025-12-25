@@ -21,7 +21,7 @@ import talib
 
 
 class EnhancedBTCMonitor:
-    def __init__(self, config_path, update_interval=1800):
+    def __init__(self, config_path, update_interval=1):
         """
         Initialize Enhanced BTC Monitor
 
@@ -38,7 +38,7 @@ class EnhancedBTCMonitor:
         self.exchange = ccxt.binance()
 
         # Alert thresholds
-        self.rsi_extreme_high = 70
+        self.rsi_extreme_high = 75
         self.rsi_extreme_low = 35
         self.volume_multiplier = 2.0
         self.last_update_id = 0
@@ -112,8 +112,7 @@ class EnhancedBTCMonitor:
         # Calculate EMAs
         ema_20 = talib.EMA(close, timeperiod=20)
         ema_50 = talib.EMA(close, timeperiod=50)
-        ema_200 = talib.EMA(close, timeperiod=200)
-
+        
         # Calculate MACD
         macd, macd_signal, macd_hist = talib.MACD(close)
 
@@ -134,7 +133,6 @@ class EnhancedBTCMonitor:
             "rsi_prev": rsi[-2] if len(rsi) > 1 else rsi[-1],
             "ema_20": ema_20[-1],
             "ema_50": ema_50[-1],
-            "ema_200": ema_200[-1],
             "macd": macd[-1],
             "macd_signal": macd_signal[-1],
             "macd_hist": macd_hist[-1],
@@ -268,12 +266,17 @@ Watch for price action confirmation.
         price = self.indicators_1h["current_price"]
         rsi_1h = self.indicators_1h["rsi"]
         rsi_4h = self.indicators_4h["rsi"]
+        
+
+        ema_20_1h = self.indicators_1h["ema_20"]
+        ema_50_1h = self.indicators_1h["ema_50"]
 
         ema_20_4h = self.indicators_4h["ema_20"]
         ema_50_4h = self.indicators_4h["ema_50"]
 
         volume_ratio_1h = self.indicators_1h["volume_ratio"]
         volume_ratio_4h = self.indicators_4h["volume_ratio"]
+
         volume_1h = self.indicators_1h["volume"]
         volume_4h = self.indicators_4h["volume"]
 
@@ -290,11 +293,18 @@ Watch for price action confirmation.
 
         # Trend determination
         if ema_20_4h > ema_50_4h:
-            trend = "📈 BULLISH"
-            trend_emoji = "🟢"
+            trend_4h = "📈 BULLISH"
+            trend_emoji_4h = "🟢"
         else:
-            trend = "📉 BEARISH"
-            trend_emoji = "🔴"
+            trend_4h = "📉 BEARISH"
+            trend_emoji_4h = "🔴"
+        
+        if ema_20_1h > ema_50_1h:
+            trend_1h = "📈 BULLISH"
+            trend_emoji_1h = "🟢"
+        else:
+            trend_1h = "📉 BEARISH"
+            trend_emoji_1h = "🔴"
 
         # Price position relative to EMAs
         if price > ema_20_4h:
@@ -317,9 +327,14 @@ Watch for price action confirmation.
 📊 4H Indicators:
 • EMA 20: ${ema_20_4h:,.2f}
 • EMA 50: ${ema_50_4h:,.2f}
-{trend_emoji} Trend: {trend}
+{trend_emoji_4h} Trend: {trend_4h}
 
-📍 Position: {price_vs_ema}
+📊 1H Indicators:
+• EMA 20: ${ema_20_1h:,.2f}
+• EMA 50: ${ema_50_1h:,.2f}
+{trend_emoji_1h} Trend: {trend_1h}
+
+📍 Position(4H): {price_vs_ema}
 🔊 Volume1H: {volume_1h} ~{volume_ratio_1h:.2f}x
 🔊 Volume4H: {volume_4h} ~{volume_ratio_4h:.2f}x "
 
@@ -574,7 +589,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--interval",
         type=int,
-        default=1800,
+        default=1,
         help="Update interval in seconds (default: 1800 = 30 min)",
     )
 
