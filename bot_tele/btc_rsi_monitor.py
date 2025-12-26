@@ -1,5 +1,5 @@
 """
-Enhanced BTC/USDT Monitor with:
+Enhanced {self.pair} Monitor with:
 - Multi-timeframe RSI monitoring (1h and 4h)
 - Extreme RSI alerts (>80 or <25)
 - Significant volume detection
@@ -14,14 +14,77 @@ import json
 import time
 from datetime import datetime, timedelta, timezone
 
+
 import ccxt
 import numpy as np
 import requests
 import talib
+from multiprocessing import Process
 
 
-class EnhancedBTCMonitor:
-    def __init__(self, config_path, update_interval=1):
+pairs_mon = []
+
+
+class TeleBotSub:
+    def __init__(self, config_path):
+        self.load_config(config_path)
+
+    def load_config(self, config_path):
+        """Load configuration from freqtrade config"""
+        with open(config_path, "r") as f:
+            config = json.load(f)
+
+        self.telegram_token = config["telegram"]["token"]
+        self.chat_id = config["telegram"]["chat_id"]
+        self.last_update_id = 0
+    
+    def telegram_bot_loop(self):
+        """Separate thread for handling Telegram commands"""
+        try:
+            updates = self.get_telegram_updates()
+
+            for update in updates:
+                self.last_update_id = update["update_id"]
+
+                if "message" in update and "text" in update["message"]:
+                    chat_id = update["message"]["chat"]["id"]
+                    text = update["message"]["text"]
+
+                    # Only process commands from authorized chat_id
+                    if str(chat_id) == str(self.chat_id):
+                        if text.startswith("/"):
+                            return (text, chat_id)
+                            # self.process_command(text, chat_id)
+                    else:
+                        print(
+                            f"⚠️ Unauthorized access attempt from chat_id: {chat_id}")
+
+            return (None, None)
+
+        except Exception as e:
+            print(f"Error in bot loop: {e}")
+
+    def get_telegram_updates(self):
+        """Poll for new Telegram messages/commands"""
+        url = f"https://api.telegram.org/bot{self.telegram_token}/getUpdates"
+        params = {"offset": self.last_update_id + 1, "timeout": 1}
+
+        try:
+            response = requests.get(url, params=params, timeout=15)
+            if response.status_code == 200:
+                data = response.json()
+                if data["ok"] and data["result"]:
+                    return data["result"]
+        except Exception as e:
+            print(f"Error getting updates: {e}")
+
+        return []
+
+
+
+
+class PairMonitor:
+    def __init__(self, config_path, update_interval=1, pair="BTC/USDT"):
         """
         Initialize Enhanced BTC Monitor
 
@@ -29,6 +92,7 @@ class EnhancedBTCMonitor:
             config_path: Path to freqtrade config.json
             update_interval: Update interval in seconds (default: 1800 = 30 minutes)
         """
+        self.pair = pair
         self.interval_noti = 1800
         self.last_noti_rsi_hi = datetime.now(timezone.utc)
         self.last_noti_volume_hi = datetime.now(timezone.utc)
@@ -39,9 +103,8 @@ class EnhancedBTCMonitor:
 
         # Alert thresholds
         self.rsi_extreme_high = 75
-        self.rsi_extreme_low = 35
-        self.volume_multiplier = 2.0
-        self.last_update_id = 0
+        self.rsi_extreme_low = 30
+        self.volume_multiplier = 2.5
 
         self.data_1h = self.get_data("1h", 100)
         self.data_4h = self.get_data("4h", 100)
@@ -65,29 +128,34 @@ class EnhancedBTCMonitor:
         """Send message to Telegram"""
         url = f"https://api.telegram.org/bot{self.telegram_token}/sendMessage"
 
-        payload = {"chat_id": self.chat_id, "text": message, "parse_mode": "HTML"}
+        payload = {"chat_id": self.chat_id,
+                   "text": message, "parse_mode": "HTML"}
 
         try:
             response = requests.post(url, json=payload)
             if response.status_code == 200:
-                print(f"✓ Message sent successfully at {datetime.now(timezone.utc)}")
+                print(
+                    f"✓ Message sent successfully at {datetime.now(timezone.utc)}")
             else:
                 print(f"✗ Failed to send message: {response.text}")
         except Exception as e:
             print(f"✗ Error sending message: {e}")
 
     def get_data(self, timeframe="1h", limit=100):
-        """Fetch BTC/USDT data from exchange"""
+        """Fetch {self.pair} data from exchange"""
         try:
-            ohlcv = self.exchange.fetch_ohlcv("BTC/USDT", timeframe, limit=limit)
+            ohlcv = self.exchange.fetch_ohlcv(
+                self.pair, timeframe, limit=limit)
 
-            closes = np.array([x[4] for x in ohlcv])
+            timestamps = np.array([x[0] for x in ohlcv])
+            opens = np.array([x[1] for x in ohlcv])
             highs = np.array([x[2] for x in ohlcv])
             lows = np.array([x[3] for x in ohlcv])
+            closes = np.array([x[4] for x in ohlcv])
             volumes = np.array([x[5] for x in ohlcv])
-            timestamps = [x[0] for x in ohlcv]
 
             return {
+                "open": opens,
                 "close": closes,
                 "high": highs,
                 "low": lows,
@@ -98,6 +166,8 @@ class EnhancedBTCMonitor:
         except Exception as e:
             print(f"Error fetching {timeframe} data: {e}")
             return None
+
+# talib trendline
 
     def calculate_indicators(self, data):
         """Calculate RSI and other indicators"""
@@ -112,16 +182,20 @@ class EnhancedBTCMonitor:
         # Calculate EMAs
         ema_20 = talib.EMA(close, timeperiod=20)
         ema_50 = talib.EMA(close, timeperiod=50)
-        
+
         # Calculate MACD
         macd, macd_signal, macd_hist = talib.MACD(close)
 
         # Calculate Bollinger Bands
-        bb_upper, bb_middle, bb_lower = talib.BBANDS(close)
+        # bb_upper, bb_middle, bb_lower = talib.BBANDS(close)
 
         # Calculate volume average and ratio
         volume_sma = talib.SMA(volume, timeperiod=20)
         volume_ratio = volume[-1] / volume_sma[-1] if volume_sma[-1] > 0 else 0
+
+        # trendlines = self.detect_trendlines(data, 200, 2)
+        # support = trendlines['support']
+        # resistance = trendlines['resistance']
 
         # Calculate ATR for volatility
         atr = talib.ATR(high, low, close, timeperiod=14)
@@ -136,13 +210,15 @@ class EnhancedBTCMonitor:
             "macd": macd[-1],
             "macd_signal": macd_signal[-1],
             "macd_hist": macd_hist[-1],
-            "bb_upper": bb_upper[-1],
-            "bb_middle": bb_middle[-1],
-            "bb_lower": bb_lower[-1],
+            # "bb_upper": bb_upper[-1],
+            # "bb_middle": bb_middle[-1],
+            # "bb_lower": bb_lower[-1],
             "volume_ratio": volume_ratio,
             "volume_24h": np.sum(volume[-24:]) if len(volume) >= 24 else 0,
             "atr": atr[-1],
             "timestamp": data["last_timestamp"],
+            # "support": trendlines["support"],
+            # "resistance": trendlines["resistance"]
         }
 
     def check_extreme_rsi(self):
@@ -170,7 +246,7 @@ class EnhancedBTCMonitor:
 🔴🔥 EXTREME OVERBOUGHT ALERT! 🔥🔴
 
 ━━━━━━━━━━━━━━━━━━━━
-📊 BTC/USDT
+📊 {self.pair}
 💰 Price: ${price:,.2f}
 ━━━━━━━━━━━━━━━━━━━━
 
@@ -201,7 +277,7 @@ Consider taking profit or opening short position
 🟢💎 EXTREME OVERSOLD ALERT! 💎🟢
 
 ━━━━━━━━━━━━━━━━━━━━
-📊 BTC/USDT
+📊 {self.pair}
 💰 Price: ${price:,.2f}
 ━━━━━━━━━━━━━━━━━━━━
 
@@ -230,7 +306,8 @@ Potential strong buying opportunity!
         ).total_seconds() > self.interval_noti
 
         if volume_ratio > self.volume_multiplier and en_noti:
-            timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            timestamp = datetime.now(
+                timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
             # Determine if bullish or bearish volume
             if rsi > 50:
@@ -244,7 +321,7 @@ Potential strong buying opportunity!
 🔊🔥 SIGNIFICANT VOLUME SPIKE! 🔥🔊
 
 ━━━━━━━━━━━━━━━━━━━━
-📊 BTC/USDT
+📊 {self.pair}
 💰 Price: ${price:,.2f}
 📈 RSI: {rsi:.2f}
 ━━━━━━━━━━━━━━━━━━━━
@@ -266,7 +343,6 @@ Watch for price action confirmation.
         price = self.indicators_1h["current_price"]
         rsi_1h = self.indicators_1h["rsi"]
         rsi_4h = self.indicators_4h["rsi"]
-        
 
         ema_20_1h = self.indicators_1h["ema_20"]
         ema_50_1h = self.indicators_1h["ema_50"]
@@ -298,7 +374,7 @@ Watch for price action confirmation.
         else:
             trend_4h = "📉 BEARISH"
             trend_emoji_4h = "🔴"
-        
+
         if ema_20_1h > ema_50_1h:
             trend_1h = "📈 BULLISH"
             trend_emoji_1h = "🟢"
@@ -316,7 +392,7 @@ Watch for price action confirmation.
 📊 4H CANDLE CLOSE UPDATE 📊
 
 ━━━━━━━━━━━━━━━━━━━━
-📊 BTC/USDT
+📊 {self.pair}
 💰 Price: ${price:,.2f}
 ━━━━━━━━━━━━━━━━━━━━
 
@@ -361,6 +437,9 @@ Next 4H close in ~4 hours
                 return True
 
         return False
+
+
+
 
     def create_regular_update(self):
         """Create regular periodic update message"""
@@ -410,9 +489,19 @@ Next 4H close in ~4 hours
 
         # MACD
         if self.indicators_1h["macd"] > self.indicators_1h["macd_signal"]:
-            macd_status = "🟢 Bullish"
+            macd_status_1h = "🟢 Bullish"
         else:
-            macd_status = "🔴 Bearish"
+            macd_status_1h = "🔴 Bearish"
+
+        if self.indicators_4h["macd"] > self.indicators_4h["macd_signal"]:
+            macd_status_4h = "🟢 Bullish"
+        else:
+            macd_status_4h = "🔴 Bearish"
+
+        if self.indicators_1d["macd"] > self.indicators_1d["macd_signal"]:
+            macd_status_1d = "🟢 Bullish"
+        else:
+            macd_status_1d = "🔴 Bearish"
 
         # Volume status
         if volume_ratio_1h > self.volume_multiplier:
@@ -432,7 +521,7 @@ Next 4H close in ~4 hours
         timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
         message = f"""
-📊 <b>BTC/USDT Market Update</b>
+📊 <b>{self.pair} Market Update</b>
 • Price Live: ${price:,.2f}
 
 • RSI 1H: {rsi_1h:.2f} ({zone_1h})
@@ -446,17 +535,17 @@ Next 4H close in ~4 hours
 • EMA 20 (1D): ${self.indicators_1d["ema_20"]:,.2f}
 • EMA 50 (1D): ${self.indicators_1d["ema_50"]:,.2f}
 
-• MACD(1H): ${self.indicators_1h["macd"]:,.2f}
-• MACD(4H): ${self.indicators_4h["macd"]:,.2f}
-• MACD(1D): ${self.indicators_1d["macd"]:,.2f}
+• MACD(1H): ${self.indicators_1h["macd"]:,.2f}  {macd_status_1h} 
+• MACD(4H): ${self.indicators_4h["macd"]:,.2f}  {macd_status_4h} 
+• MACD(1D): ${self.indicators_1d["macd"]:,.2f}  {macd_status_1d}
 {vol_text}
 ⏰ <b>Time:</b> {timestamp}
 """
 
         return message
 
-    def tele_update(self, en_verbose):
-        # print(f"\n📡 Fetching BTC/USDT data...")
+    def tele_update(self, en_verbose, pair="{self.pair}"):
+        # print(f"\n📡 Fetching {self.pair} data...")
 
         # Fetch both 1h and 4h data
         self.data_1h = self.get_data("1h", 100)
@@ -481,73 +570,37 @@ Next 4H close in ~4 hours
             self.check_significant_volume(self.indicators_1h)
 
             # Check if 4h candle closed
-            if self.is_4h_candle_close(self.indicators_4h["timestamp"]) or en_verbose:
-                self.send_4h_close_update()
+            # if self.is_4h_candle_close(self.indicators_4h["timestamp"]) or en_verbose:
+            #     self.send_4h_close_update()
 
-            # Send regular update
-            if self.is_4h_candle_close(self.indicators_4h["timestamp"]) or en_verbose:
+            # # Send regular update
+            if en_verbose:
                 message = self.create_regular_update()
                 self.send_telegram(message)
 
     # ============================================
-    def telegram_bot_loop(self):
-        """Separate thread for handling Telegram commands"""
-        try:
-            updates = self.get_telegram_updates()
-
-            for update in updates:
-                self.last_update_id = update["update_id"]
-
-                if "message" in update and "text" in update["message"]:
-                    chat_id = update["message"]["chat"]["id"]
-                    text = update["message"]["text"]
-
-                    # Only process commands from authorized chat_id
-                    if str(chat_id) == str(self.chat_id):
-                        if text.startswith("/"):
-                            self.process_command(text, chat_id)
-                    else:
-                        print(f"⚠️ Unauthorized access attempt from chat_id: {chat_id}")
-
-        except Exception as e:
-            print(f"Error in bot loop: {e}")
-
-    def get_telegram_updates(self):
-        """Poll for new Telegram messages/commands"""
-        url = f"https://api.telegram.org/bot{self.telegram_token}/getUpdates"
-        params = {"offset": self.last_update_id + 1, "timeout": 1}
-
-        try:
-            response = requests.get(url, params=params, timeout=15)
-            if response.status_code == 200:
-                data = response.json()
-                if data["ok"] and data["result"]:
-                    return data["result"]
-        except Exception as e:
-            print(f"Error getting updates: {e}")
-
-        return []
-
+    
     def process_command(self, command, chat_id):
         """Process Telegram bot commands"""
         command = command.lower().strip()
 
         print(f"📨 Received command: {command}")
 
-        if command == "/technical":
+        if command == "/now":
             message = self.create_regular_update()
             self.send_telegram(message)
 
         else:
             message = f"❓ Unknown command: {command}\n\nUse /help to see available commands."
-            self.send_telegram(message, chat_id)
+            self.send_telegram(message)
 
-    def run(self):
+    def Init(self):
         """Main monitoring loop"""
-        print(f"🚀 Enhanced BTC/USDT Monitor Started")
+        print(f"🚀 Enhanced {self.pair} Monitor Started")
         print(f"⏰ Update interval: {self.update_interval // 60} minutes")
         print(f"📊 Monitoring: 1h and 4h timeframes")
-        print(f"🎯 RSI Alerts: >{self.rsi_extreme_high} or <{self.rsi_extreme_low}")
+        print(
+            f"🎯 RSI Alerts: >{self.rsi_extreme_high} or <{self.rsi_extreme_low}")
         print(f"🔊 Volume Alert: >{self.volume_multiplier}x average")
         print(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
@@ -555,7 +608,7 @@ Next 4H close in ~4 hours
         startup_msg = f"""
 🤖 <b>Enhanced BTC Monitor Started</b>
 
-Monitoring BTC/USDT on multiple timeframes
+Monitoring {self.pair} on multiple timeframes
 • 1h and 4h RSI tracking
 • Extreme RSI alerts (>{self.rsi_extreme_high} or <{self.rsi_extreme_low})
 • Significant volume detection (>{self.volume_multiplier}x)
@@ -568,32 +621,45 @@ Waiting for first update...
         self.send_telegram(startup_msg)
         self.tele_update(en_verbose=True)
 
-        while True:
-            try:
-                self.tele_update(en_verbose=False)
-                self.telegram_bot_loop()
-                time.sleep(0.5)
 
-            except KeyboardInterrupt:
-                print("\n\n👋 Monitor stopped by user")
-                break
-            except Exception as e:
-                print(f"\n❌ Error in monitoring loop: {e}")
-                print(f"Retrying in 60 seconds...")
-                time.sleep(60)
+    def update(self):
+        try:
+            self.tele_update(en_verbose=False)
+        except KeyboardInterrupt:
+            print("\n\n👋 Monitor stopped by user")
+        except Exception as e:
+            print(f"\n❌ Error in monitoring loop: {e}")
+            print(f"Retrying in 60 seconds...")
+            time.sleep(60)
+
+
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Enhanced BTC/USDT Monitor")
-    parser.add_argument("--config", type=str, required=True, help="Path to freqtrade config.json")
+    parser = argparse.ArgumentParser(
+        description="Enhanced {self.pair} Monitor")
+    parser.add_argument("--config", type=str, required=True,
+                        help="Path to freqtrade config.json")
     parser.add_argument(
         "--interval",
         type=int,
         default=1,
         help="Update interval in seconds (default: 1800 = 30 min)",
     )
-
     args = parser.parse_args()
+    pairs = ["BTC/USDT", "PAXG/USDT"]
+    tele_subcribe = TeleBotSub(args.config)
 
-    monitor = EnhancedBTCMonitor(args.config, args.interval)
-    monitor.run()
+    for pair in pairs:
+        p = PairMonitor(args.config, args.interval, pair=pair)
+        p.Init()
+        pairs_mon.append(p)
+
+    while True:
+        for p in pairs_mon:
+            p.update()
+        text, chat_id = tele_subcribe.telegram_bot_loop()
+
+        if text:
+            for p in pairs_mon:
+                p.process_command(text, chat_id)
